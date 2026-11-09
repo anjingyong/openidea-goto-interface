@@ -1,0 +1,9 @@
+/target
+# build output: rebuilt by `openidea-plugin build`
+/dist
+# release artefacts: attached to GitHub releases, not committed
+*.oiplugin
+# publisher signing keys: never commit
+*.key
+# local scratch (cargo/rustdoc temp dirs)
+.tmp/

@@ -1,0 +1,36 @@
+id = "allen.goto-interface"
+name = "Go to Interface"
+version = "0.1.0"
+description = "Jump from a Go method to the interface it satisfies. No Go language server needed."
+authors = ["allen"]
+license = "MIT"
+change-notes = "0.1.0 — first release: gutter markers and ⌘B jump from a Go method to the interface method it satisfies, with no Go language server."
+# Marketplace categories (up to 3): languages, themes, icon-themes, linters,
+# vcs, ai, frameworks, tools, other.
+categories = ["tools"]
+icon = "icon.svg"
+icon-dark = "icon_dark.svg"
+engines.openidea = "^1.3"
+wasm = "dist/plugin.wasm"
+activation = ["on-file:**/*.go"]
+
+# What the code may do. The user approves these when installing.
+[capabilities]
+required = ["editor.read", "project.read"]
+
+[[contributes.commands]]
+id = "goto-interface"
+title = "Go to Interface: Jump to Interface Method"
+category = "Go"
+when = "editorFocus"
+
+# Go has no language server in this IDE, so both the gutter marker and the
+# jump have to come from the plugin.
+[[contributes.providers]]
+kinds = ["line-markers", "definition"]
+languages = ["go"]
+
+[[contributes.markerIcons]]
+id = "implementing"
+icon = "markers/marker-interface.svg"
+iconDark = "markers/marker-interface.svg"
