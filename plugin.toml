@@ -1,10 +1,10 @@
 id = "allen.goto-interface"
 name = "Go to Interface"
-version = "0.1.0"
+version = "0.2.0"
 description = "Jump from a Go method to the interface it satisfies. No Go language server needed."
 authors = ["allen"]
 license = "MIT"
-change-notes = "0.1.0 — first release: gutter markers and ⌘B jump from a Go method to the interface method it satisfies, with no Go language server."
+change-notes = "0.2.0 — resolves interfaces in other packages through `var _ pkg.Iface = &T{}` assertions, so generated gRPC stubs are covered."
 # Marketplace categories (up to 3): languages, themes, icon-themes, linters,
 # vcs, ai, frameworks, tools, other.
 categories = ["tools"]

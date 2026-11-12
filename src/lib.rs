@@ -1,20 +1,30 @@
-//! Goto Interface: jump from a Go method to the interface method it satisfies.
+//! Go to Interface: jump from a Go method to the interface method it satisfies.
 //!
 //! The IDE has no Go language server, so everything here is inferred from the
-//! text: scan the package for `type X interface { ... }` blocks and match by
-//! method name + parameter count. Anything ambiguous stays silent — a marker
-//! that jumps to the wrong place is worse than no marker.
+//! text. Two routes are tried, cheapest first:
+//!
+//! 1. `var _ pkg.Iface = &T{}` assertions in the package. They name the
+//!    interface explicitly, so it is resolved through the IDE's symbol index —
+//!    the only way to reach interfaces in other packages (generated gRPC
+//!    stubs, most often).
+//! 2. Otherwise, `type X interface { ... }` blocks of the *same* package.
+//!
+//! Anything ambiguous stays silent — a marker that jumps to the wrong place is
+//! worse than no marker.
 
 use std::collections::HashMap;
 
 use openidea_plugin::host;
 use openidea_plugin::providers::{Document, LineMarker, Providers};
 use openidea_plugin::{
-    Error, Invocation, Location, NotificationLevel, Plugin, Position, Range, register_plugin,
+    Error, Invocation, Location, NotificationLevel, Plugin, Position, Project, Range,
+    register_plugin,
 };
 
 /// Upper bound on package files scanned per request (editing path budget).
 const MAX_FILES: u32 = 200;
+/// Upper bound on symbol-index probes per request.
+const MAX_SYMBOLS: u32 = 20;
 
 // ---------------------------------------------------------------- 数据模型
 
@@ -30,10 +40,19 @@ struct IfaceMethod {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GoMethod {
+    /// Receiver base type (`service` for `func (s *service)`).
+    recv: String,
     name: String,
     params: usize,
     /// 0-based line of the `func` line.
     line: u32,
+}
+
+/// `var _ pkg.Iface = &T{}` — "T is meant to satisfy Iface".
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Assertion {
+    recv: String,
+    iface: String,
 }
 
 // ---------------------------------------------------------------- 文本工具
@@ -181,6 +200,22 @@ fn count_params(inner: &str) -> usize {
     count
 }
 
+/// Base type name of a type expression: `*service`, `service[T]`,
+/// `(*baz)(nil)` -> `service`, `service`, `baz`.
+fn base_type(expr: &str) -> String {
+    let mut s = expr.trim();
+    s = s.trim_start_matches('(');
+    s = s.trim_start_matches('&');
+    s = s.trim_start_matches('*');
+    s = s.trim_end_matches(')');
+    for stop in ['[', '{', ' ', ')', '*'] {
+        if let Some(idx) = s.find(stop) {
+            s = &s[..idx];
+        }
+    }
+    s.trim().to_string()
+}
+
 /// `Name(a, b) result` -> ("Name", 2).
 fn iface_signature(line: &str) -> Option<(String, usize)> {
     let open = line.find('(')?;
@@ -195,17 +230,29 @@ fn iface_signature(line: &str) -> Option<(String, usize)> {
     Some((name.to_string(), count_params(&line[open + 1..close])))
 }
 
-/// `func (c *T) Name(a int) err` -> Some(("Name", 1)); top-level functions
+/// `func (c *T) Name(a int) err` -> Some(("T", "Name", 1)); top-level functions
 /// (no receiver) return None — they cannot satisfy an interface.
-fn method_signature(line: &str) -> Option<(String, usize)> {
+fn method_signature(line: &str) -> Option<(String, String, usize)> {
     let rest = line.strip_prefix("func")?;
     let rest = rest.trim_start();
     if !rest.starts_with('(') {
         return None;
     }
     let close = matching_paren(rest, 0)?;
+    let recv = recv_type(&rest[1..close])?;
     let after = rest[close + 1..].trim_start();
-    iface_signature(after)
+    let (name, params) = iface_signature(after)?;
+    Some((recv, name, params))
+}
+
+/// `s *service` -> Some("service").
+fn recv_type(recv: &str) -> Option<String> {
+    let last = recv.split_whitespace().last()?;
+    let ty = base_type(last);
+    if ty.is_empty() || !ty.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false) {
+        return None;
+    }
+    Some(ty)
 }
 
 /// `type X interface {` -> Some("X").
@@ -213,7 +260,7 @@ fn interface_name(line: &str) -> Option<String> {
     let rest = line.strip_prefix("type")?;
     let rest = rest.trim_start();
     if rest.starts_with('(') {
-        return None; // grouped type declaration: not supported in v0.1
+        return None; // grouped type declaration: not supported yet
     }
     let mut parts = rest.split_whitespace();
     let name = parts.next()?;
@@ -291,13 +338,45 @@ fn parse_methods(text: &str) -> Vec<GoMethod> {
         if code.is_empty() {
             continue;
         }
-        if let Some((name, params)) = method_signature(code) {
+        if let Some((recv, name, params)) = method_signature(code) {
             out.push(GoMethod {
+                recv,
                 name,
                 params,
                 line: idx as u32,
             });
         }
+    }
+    out
+}
+
+/// `var _ pkg.Iface = &T{}` / `= (*T)(nil)` declarations in this file.
+fn parse_assertions(text: &str) -> Vec<Assertion> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let code = strip_comment(raw).trim();
+        let Some(rest) = code.strip_prefix("var _") else {
+            continue;
+        };
+        let Some((left, right)) = rest.split_once('=') else {
+            continue;
+        };
+        let iface = left.trim().rsplit('.').next().unwrap_or("").trim();
+        if iface.is_empty() {
+            continue;
+        }
+        let rhs = right.trim();
+        if !(rhs.starts_with('&') || rhs.starts_with("(*")) {
+            continue;
+        }
+        let recv = base_type(rhs);
+        if recv.is_empty() {
+            continue;
+        }
+        out.push(Assertion {
+            recv,
+            iface: iface.to_string(),
+        });
     }
     out
 }
@@ -321,80 +400,154 @@ fn unique_match<'a>(method: &GoMethod, ifaces: &'a [IfaceMethod]) -> Option<&'a 
 
 #[derive(Default)]
 pub struct Main {
-    /// package dir -> (document version it was built from, interface methods)
-    cache: HashMap<String, (u64, Vec<IfaceMethod>)>,
+    /// package dir -> (document version, same-package interfaces, assertions)
+    package_cache: HashMap<String, (u64, Vec<IfaceMethod>, Vec<Assertion>)>,
+    /// interface name -> (document version, its methods)
+    iface_cache: HashMap<String, (u64, Vec<IfaceMethod>)>,
 }
 
 impl Main {
-    fn analyze(&mut self, doc: &Document) -> Option<(Vec<GoMethod>, Vec<IfaceMethod>)> {
-        // Guard on the path, not on `doc.language`: this IDE has no Go support
-        // installed, so the language id may not be "go".
-        if !doc.path.ends_with(".go") {
-            return None;
+    /// Interfaces declared in the document's own package, plus the
+    /// `var _ ... = &T{}` assertions found there.
+    fn scan_package(
+        &mut self,
+        project: &Project,
+        root: &str,
+        dir: &str,
+        doc: &Document,
+    ) -> (Vec<IfaceMethod>, Vec<Assertion>) {
+        if let Some((version, ifaces, asserts)) = self.package_cache.get(dir) {
+            if *version == doc.version {
+                return (ifaces.clone(), asserts.clone());
+            }
         }
-        let project = host::project_of(&doc.path)?;
-        let root = project.root().ok()?;
-        let idx = doc.path.rfind('/')?;
-        let dir = doc.path[..idx].to_string();
-
-        let rel = dir
-            .strip_prefix(&root)
-            .map(|r| r.trim_start_matches('/'))
-            .unwrap_or("")
-            .to_string();
+        let rel = dir.strip_prefix(root).unwrap_or("").trim_start_matches('/');
         let glob = if rel.is_empty() {
             "*.go".to_string()
         } else {
             format!("{rel}/*.go")
         };
+        let mut ifaces = Vec::new();
+        let mut asserts = Vec::new();
+        if let Ok(files) = project.find_files(&glob, MAX_FILES) {
+            for path in files {
+                if !path.ends_with(".go") || path.ends_with("_test.go") {
+                    continue;
+                }
+                let abs = if path.starts_with('/') {
+                    path.clone()
+                } else {
+                    format!("{root}/{}", path.trim_start_matches('/'))
+                };
+                if let Ok(text) = project.read_file(&abs) {
+                    ifaces.extend(parse_ifaces(&abs, &text));
+                    asserts.extend(parse_assertions(&text));
+                }
+            }
+        }
+        self.package_cache
+            .insert(dir.to_string(), (doc.version, ifaces.clone(), asserts.clone()));
+        (ifaces, asserts)
+    }
 
-        let ifaces = match self.cache.get(&dir) {
-            Some((version, cached)) if *version == doc.version => cached.clone(),
-            _ => {
-                let mut found = Vec::new();
-                if let Ok(files) = project.find_files(&glob, MAX_FILES) {
-                    for path in files {
-                        if !path.ends_with(".go") || path.ends_with("_test.go") {
-                            continue;
-                        }
-                        let abs = if path.starts_with('/') {
-                            path.clone()
-                        } else {
-                            format!("{root}/{}", path.trim_start_matches('/'))
-                        };
-                        if let Ok(text) = project.read_file(&abs) {
-                            found.extend(parse_ifaces(&abs, &text));
-                        }
+    /// Methods of a named interface, wherever it lives. The symbol index is the
+    /// only project-wide lookup available at plugin API 1.3 — there is no text
+    /// search here — and it is what makes cross-package interfaces reachable.
+    fn resolve_iface(&mut self, project: &Project, name: &str, version: u64) -> Vec<IfaceMethod> {
+        if let Some((cached_version, methods)) = self.iface_cache.get(name) {
+            if *cached_version == version {
+                return methods.clone();
+            }
+        }
+        let mut found = Vec::new();
+        if let Ok(symbols) = project.symbols(name, MAX_SYMBOLS) {
+            for sym in symbols {
+                if sym.name != name || !sym.location.path.ends_with(".go") {
+                    continue;
+                }
+                let path = sym.location.path.clone();
+                if let Ok(text) = project.read_file(&path) {
+                    let methods: Vec<IfaceMethod> = parse_ifaces(&path, &text)
+                        .into_iter()
+                        .filter(|m| m.iface == name)
+                        .collect();
+                    if !methods.is_empty() {
+                        found = methods;
+                        break;
                     }
                 }
-                self.cache.insert(dir.clone(), (doc.version, found.clone()));
-                found
             }
-        };
-
-        Some((parse_methods(&doc.text), ifaces))
+        }
+        self.iface_cache
+            .insert(name.to_string(), (version, found.clone()));
+        found
     }
 
     fn markers_for(&mut self, doc: &Document) -> Vec<LineMarker> {
-        let Some((methods, ifaces)) = self.analyze(doc) else {
+        // Guard on the path, not on `doc.language`: this IDE has no Go support
+        // installed, so the language id may not be "go".
+        if !doc.path.ends_with(".go") {
+            return Vec::new();
+        }
+        let Some(project) = host::project_of(&doc.path) else {
             return Vec::new();
         };
+        let Ok(root) = project.root() else {
+            return Vec::new();
+        };
+        let Some(idx) = doc.path.rfind('/') else {
+            return Vec::new();
+        };
+        let dir = doc.path[..idx].to_string();
+
+        let (same_package, asserts) = self.scan_package(&project, &root, &dir, doc);
+        let methods = parse_methods(&doc.text);
+
         let mut out = Vec::new();
         for method in &methods {
-            let Some(hit) = unique_match(method, &ifaces) else {
-                continue;
-            };
-            out.push(LineMarker {
-                line: method.line,
-                icon: Some("implementing".to_string()),
-                tooltip: format!("{}.{}", hit.iface, hit.name),
-                target: Some(Location {
-                    path: hit.path.clone(),
-                    range: Range::new(Position::new(hit.line, 0), Position::new(hit.line, 0)),
-                }),
-            });
+            // Route 1: the package asserts `var _ pkg.Iface = &T{}`.
+            let asserted: Vec<&Assertion> =
+                asserts.iter().filter(|a| a.recv == method.recv).collect();
+            if !asserted.is_empty() {
+                let mut hit: Option<IfaceMethod> = None;
+                let mut ambiguous = false;
+                for assertion in asserted {
+                    for cand in self.resolve_iface(&project, &assertion.iface, doc.version) {
+                        if cand.name == method.name && cand.params == method.params {
+                            if hit.is_some() {
+                                ambiguous = true;
+                            } else {
+                                hit = Some(cand);
+                            }
+                        }
+                    }
+                }
+                if ambiguous {
+                    continue;
+                }
+                if let Some(cand) = hit {
+                    out.push(marker_for(method.line, &cand));
+                    continue;
+                }
+            }
+            // Route 2: an interface of the same package.
+            if let Some(cand) = unique_match(method, &same_package) {
+                out.push(marker_for(method.line, cand));
+            }
         }
         out
+    }
+}
+
+fn marker_for(line: u32, hit: &IfaceMethod) -> LineMarker {
+    LineMarker {
+        line,
+        icon: Some("implementing".to_string()),
+        tooltip: format!("{}.{}", hit.iface, hit.name),
+        target: Some(Location {
+            path: hit.path.clone(),
+            range: Range::new(Position::new(hit.line, 0), Position::new(hit.line, 0)),
+        }),
     }
 }
 
@@ -423,18 +576,18 @@ impl Plugin for Main {
         match id {
             "goto-interface" => {
                 let editor = ctx.editor().ok_or("no file is open")?;
-                let doc = editor.document()?;
+                let document = editor.document()?;
                 let markers = self.markers_for(&Document {
                     path: editor.path().to_string(),
                     language: "go".to_string(),
-                    version: doc.version,
-                    text: doc.text,
+                    version: document.version,
+                    text: document.text,
                 });
                 let body = match markers.len() {
                     0 => "No interface method found for this function".to_string(),
                     n => format!("{n} method(s) satisfy an interface method"),
                 };
-                host::notify(NotificationLevel::Info, "Goto Interface", &body);
+                host::notify(NotificationLevel::Info, "Go to Interface", &body);
                 Ok(None)
             }
             _ => Err(format!("unknown command {id}").into()),
@@ -451,27 +604,27 @@ mod tests {
     use super::*;
 
     const IFACE: &str = r#"
-package template
+package cubebox
 
-type TemplateService interface {
-    ListTemplates(ctx context.Context, clusterID string) ([]Template, error)
-    DeleteTemplate(ctx context.Context, clusterID, id string) error
+// CubeboxMgrServer is the server API for CubeboxMgr service.
+type CubeboxMgrServer interface {
+    Create(context.Context, *RunCubeSandboxRequest) (*RunCubeSandboxResponse, error)
+    List(context.Context, *ListCubeSandboxRequest) (*ListCubeSandboxResponse, error)
 }
 "#;
 
-    const IMPL: &str = r#"
-package template
+    const SERVICE: &str = r#"
+package cubebox
 
-// ListTemplates 列出集群下的模板。
-func (c *httpClient) ListTemplates(ctx context.Context, clusterID string) ([]Template, error) {
+var _ cubebox.CubeboxMgrServer = &service{}
+
+func (s *service) Create(ctx context.Context, req *cubebox.RunCubeSandboxRequest) (*cubebox.RunCubeSandboxResponse, error) {
     return nil, nil
 }
 
-func (c *httpClient) DeleteTemplate(ctx context.Context, clusterID, id string) error {
+func (s *service) helperOnly(ctx context.Context) error {
     return nil
 }
-
-func helper(a, b int) int { return a + b }
 "#;
 
     #[test]
@@ -479,48 +632,54 @@ func helper(a, b int) int { return a + b }
         assert_eq!(count_params(""), 0);
         assert_eq!(count_params("a int"), 1);
         assert_eq!(count_params("ctx context.Context, clusterID string"), 2);
-        assert_eq!(count_params("ctx context.Context, clusterID, id string"), 3);
+        assert_eq!(count_params("context.Context, *RunCubeSandboxRequest"), 2);
         assert_eq!(count_params("fn func(a, b int), xs []int"), 2);
         assert_eq!(count_params("m map[string]int"), 1);
     }
 
     #[test]
     fn parses_interface_methods() {
-        let ifaces = parse_ifaces("/p/template/iface.go", IFACE);
+        let ifaces = parse_ifaces("/p/cubebox_grpc.pb.go", IFACE);
         assert_eq!(ifaces.len(), 2);
-        assert_eq!(ifaces[0].iface, "TemplateService");
-        assert_eq!(ifaces[0].name, "ListTemplates");
+        assert_eq!(ifaces[0].iface, "CubeboxMgrServer");
+        assert_eq!(ifaces[0].name, "Create");
         assert_eq!(ifaces[0].params, 2);
-        assert_eq!(ifaces[1].params, 3);
-        assert_eq!(ifaces[0].line, 4);
     }
 
     #[test]
-    fn ignores_top_level_functions() {
-        let methods = parse_methods(IMPL);
-        let names: Vec<&str> = methods.iter().map(|m| m.name.as_str()).collect();
-        assert_eq!(names, vec!["ListTemplates", "DeleteTemplate"]);
-        assert_eq!(methods[0].line, 4);
+    fn parses_receiver_type() {
+        let methods = parse_methods(SERVICE);
+        assert_eq!(methods.len(), 2);
+        assert_eq!(methods[0].recv, "service");
+        assert_eq!(methods[0].name, "Create");
+        assert_eq!(methods[0].params, 2);
     }
 
     #[test]
-    fn matches_unique_pair() {
-        let ifaces = parse_ifaces("/p/template/iface.go", IFACE);
-        let methods = parse_methods(IMPL);
+    fn parses_assertions() {
+        let asserts = parse_assertions(SERVICE);
+        assert_eq!(asserts.len(), 1);
+        assert_eq!(asserts[0].recv, "service");
+        assert_eq!(asserts[0].iface, "CubeboxMgrServer");
+    }
+
+    #[test]
+    fn parses_pointer_nil_assertion() {
+        let text = "var _ foo.Bar = (*baz)(nil)\n";
+        let asserts = parse_assertions(text);
+        assert_eq!(asserts[0].recv, "baz");
+        assert_eq!(asserts[0].iface, "Bar");
+    }
+
+    #[test]
+    fn cross_package_signature_matches_by_arity() {
+        // Named parameters on the implementation, unnamed in the interface.
+        let ifaces = parse_ifaces("/p/pb.go", IFACE);
+        let methods = parse_methods(SERVICE);
         let hit = unique_match(&methods[0], &ifaces).expect("should match");
-        assert_eq!(hit.iface, "TemplateService");
-        assert_eq!(hit.line, 4);
-    }
-
-    #[test]
-    fn arity_mismatch_is_not_a_match() {
-        let ifaces = parse_ifaces("/p/template/iface.go", IFACE);
-        let odd = GoMethod {
-            name: "ListTemplates".into(),
-            params: 3,
-            line: 9,
-        };
-        assert!(unique_match(&odd, &ifaces).is_none());
+        assert_eq!(hit.iface, "CubeboxMgrServer");
+        assert_eq!(hit.name, "Create");
+        assert!(unique_match(&methods[1], &ifaces).is_none());
     }
 
     #[test]
@@ -536,6 +695,7 @@ type B interface {
 "#;
         let ifaces = parse_ifaces("/p/x.go", text);
         let method = GoMethod {
+            recv: "T".into(),
             name: "Foo".into(),
             params: 1,
             line: 0,

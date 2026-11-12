@@ -7,3 +7,4 @@
 *.key
 # local scratch (cargo/rustdoc temp dirs)
 .tmp/
+.openidea/
